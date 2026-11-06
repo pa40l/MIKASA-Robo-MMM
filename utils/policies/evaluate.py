@@ -118,8 +118,16 @@ def robomme_observation(obs, prompt):
 
 
 def mikasa_observation(obs, prompt):
+    """utils/collection/client.py's observation of the three reference cameras. jezv's scenes also
+    render a scene camera of their own (their `_default_sensor_configs`) that his datasets do not
+    hold; it is left out."""
     from utils.collection.client import policy_observation
 
+    sensors = obs["sensor_data"]
+    if set(sensors) != set(CAMERAS):
+        if missing := set(CAMERAS) - set(sensors):
+            raise ValueError(f"the scene lacks the cameras {sorted(missing)}")
+        obs = {**obs, "sensor_data": {camera: sensors[camera] for camera in CAMERAS}}
     return policy_observation(obs, prompt)
 
 

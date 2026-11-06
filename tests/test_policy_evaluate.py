@@ -308,3 +308,17 @@ def test_done_elsewhere_reads_the_same_runs_other_shard_layouts(tmp_path):
     write("shard-0-of-8.json", "0/8", [{"task": "veggie", "seed": 3}])  # this shard's own output
     (tmp_path / "broken.json").write_text("{")
     assert ev.done_elsewhere(tmp_path, tmp_path / "shard-0-of-8.json", header) == {("veggie", 1)}
+
+
+def test_observation_leaves_out_a_scene_camera_and_needs_the_three_of_the_robot():
+    def sensors(*names):
+        shape = {"fetch_hand": (1, 128, 128, 3)}
+        return {name: {"rgb": np.zeros(shape.get(name, (1, 256, 256, 3)), np.uint8)} for name in names}
+
+    obs = {"agent": {"qpos": np.zeros((1, 15), np.float32)},
+           "sensor_data": sensors(*ev.CAMERAS, "base_camera")}  # jezv's scenes add their own camera
+    observation = ev.mikasa_observation(obs, "go")
+    assert sorted(key for key in observation if key.startswith("observation.images.")) == sorted(
+        f"observation.images.{camera}" for camera in ev.CAMERAS)
+    with pytest.raises(ValueError, match="lacks"):
+        ev.mikasa_observation({**obs, "sensor_data": sensors("fetch_hand", "base_camera")}, "go")
