@@ -222,7 +222,13 @@ def test_high_level_server_decodes_the_frames_and_reports_errors():
 
     class Connection:
         def __init__(self, requests):
-            self.requests, self.sent = list(requests), []
+            self.requests, self.sent, self.closed = list(requests), [], False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.closed = True
 
         def recv(self):
             if not self.requests:
@@ -235,3 +241,70 @@ def test_high_level_server_decodes_the_frames_and_reports_errors():
     connection = Connection([{"cmd": "fly"}, {"cmd": "metadata"}])
     server.serve(connection, policy, {"model": "m"})
     assert "unknown command" in connection.sent[0]["error"] and connection.sent[1] == {"model": "m"}
+    assert connection.closed
+
+
+def test_high_level_server_gives_every_client_its_own_memory_and_one_model():
+    import threading
+    from multiprocessing import Pipe
+
+    server = load_server()
+    running, peak, calls = [0], [0], []
+
+    @dataclasses.dataclass
+    class Result:
+        prompt: str
+
+    class Model:  # records how many predictions overlap
+        def predict(self, prompt, images):
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+            calls.append(prompt)
+            threading.Event().wait(0.01)
+            running[0] -= 1
+            return Result(prompt)
+
+    class Policy:  # MemERDeploymentPolicy's shape: a client's own frames, the shared model
+        def __init__(self, model):
+            self.model, self.frames = model, 0
+
+        def reset(self, instruction):
+            self.instruction, self.frames = instruction, 0
+
+        def step(self, *frames):
+            self.frames += len(frames)
+            return self.model.predict(f"{self.instruction}:{self.frames}", frames)
+
+    shared = server.SerialPredictor(Model())
+    clients, threads = [], []
+    for name in ("a", "b", "c"):
+        near, far = Pipe()
+        threads.append(threading.Thread(target=server.serve, args=(far, Policy(shared), {}), daemon=True))
+        threads[-1].start()
+        clients.append((name, near))
+    frame = ev.encode_frame(observation())
+    for name, near in clients:
+        near.send({"cmd": "reset", "instruction": name})
+    assert [near.recv() for _, near in clients] == [{"ok": True}] * 3
+    for frames in (1, 2):
+        for _, near in clients:
+            near.send({"cmd": "step", "frames": [frame] * frames})
+        expected = [{"prompt": f"{name}:{1 if frames == 1 else 3}"} for name, _ in clients]
+        assert [near.recv() for _, near in clients] == expected
+    for _, near in clients:
+        near.close()
+    for thread in threads:
+        thread.join(2)
+    assert not any(thread.is_alive() for thread in threads)  # a hung-up client ends its thread
+    assert peak[0] == 1 and len(calls) == 6  # one prediction at a time
+
+
+def test_done_elsewhere_reads_the_same_runs_other_shard_layouts(tmp_path):
+    header = {"backend": "memer", "execution": "midpoint", "shard": "0/8", "tasks": {"veggie": {"episodes": 2}}}
+    def write(name, shard, rollouts, **change):
+        (tmp_path / name).write_text(json.dumps({**header, **change, "shard": shard, "rollouts": rollouts}))
+    write("shard-0-of-4.json", "0/4", [{"task": "veggie", "seed": 1}])
+    write("other-settings.json", "1/4", [{"task": "veggie", "seed": 2}], execution="hold")
+    write("shard-0-of-8.json", "0/8", [{"task": "veggie", "seed": 3}])  # this shard's own output
+    (tmp_path / "broken.json").write_text("{")
+    assert ev.done_elsewhere(tmp_path, tmp_path / "shard-0-of-8.json", header) == {("veggie", 1)}

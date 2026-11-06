@@ -490,6 +490,22 @@ def make_client(args):
     return (RoboMMEClient if args.backend == "robomme" else HamletClient)(args.host, args.port)
 
 
+def done_elsewhere(folder, output, header):
+    """(task, seed) of the rollouts in the folder's other outputs with these settings, any shard."""
+    same = {key: value for key, value in header.items() if key != "shard"}
+    done = set()
+    for path in sorted(Path(folder).glob("*.json")):
+        if path.resolve() == Path(output).resolve():
+            continue
+        try:
+            other = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if {key: other.get(key) for key in same} == same:
+            done |= {(result["task"], result["seed"]) for result in other["rollouts"]}
+    return done
+
+
 def write_json(path, value):
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(value, indent=2) + "\n")
@@ -521,6 +537,8 @@ def evaluate(args):
             raise ValueError(f"{args.output} was written with other settings; not resuming into it")
         results = previous["rollouts"]
     done = {(result["task"], result["seed"]) for result in results}
+    if args.done_dir:
+        done |= done_elsewhere(args.done_dir, args.output, header)
     client = make_client(args)
     header["code"], header["client"] = code_provenance(), getattr(client, "metadata", None)
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -583,6 +601,8 @@ def main():
     parser.add_argument("--shard", default="0/1", help="k/n: every n-th rollout from the k-th")
     parser.add_argument("--video", type=int, default=0, help="save the first N episodes of each task")
     parser.add_argument("--resume", action="store_true", help="continue an --output written with the same settings")
+    parser.add_argument("--done-dir", type=Path,
+                        help="skip rollouts already in this folder's outputs of the same settings (any shard layout)")
     args = parser.parse_args()
     if min(args.execution_horizon, args.episodes, args.port, args.high_port) <= 0 or (
             args.max_steps is not None and args.max_steps <= 0):

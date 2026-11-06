@@ -4,7 +4,9 @@ Runs in the Qwen3-VL env; the authors' memer_eval comes from third_party/memer:
     ~/envs/qwen3vl/bin/python vla/memer/serve_high.py --model ~/memer-run/high-1500 \
         [--port 8100] [--system-role assistant] [--device cuda:0]
 
-One client at a time: one evaluation shard per server and GPU. Per episode the client sends
+Many clients, one model: every connection (an evaluation shard) gets a thread and a MemER
+memory of its own, and the predictions run one at a time on the GPU, so the shards of a GPU
+share one server, as they share the low level's. Per episode the client sends
 `reset` with the task instruction, then at every low-level query `step` with the 10 Hz frames
 since its previous call; the model runs once, at the newest frame (memer_eval/deploy.py,
 MemERDeploymentPolicy). The context is the SFT export's (vla/memer/export_sft.sh): the three
@@ -22,6 +24,7 @@ import dataclasses
 import logging
 import os
 import sys
+import threading
 from multiprocessing import AuthenticationError
 from multiprocessing.connection import Listener
 from pathlib import Path
@@ -51,18 +54,31 @@ def handle(policy, request, metadata):
     raise ValueError(f"unknown command {command!r}")
 
 
+class SerialPredictor:
+    """One model for every client: its predictions run one at a time."""
+
+    def __init__(self, predictor):
+        self.predictor, self.lock = predictor, threading.Lock()
+
+    def predict(self, prompt, images):
+        with self.lock:
+            return self.predictor.predict(prompt, images)
+
+
 def serve(connection, policy, metadata):
-    while True:
-        try:
-            request = connection.recv()
-        except EOFError:
-            return
-        try:
-            reply = handle(policy, request, metadata)
-        except Exception as error:  # the client raises it; the server stays up for the next shard
-            logging.exception("request %r failed", request.get("cmd"))
-            reply = {"error": f"{type(error).__name__}: {error}"}
-        connection.send(reply)
+    """One client's requests until it hangs up; then the connection is closed."""
+    with connection:
+        while True:
+            try:
+                request = connection.recv()
+            except (EOFError, OSError):
+                return
+            try:
+                reply = handle(policy, request, metadata)
+            except Exception as error:  # the client raises it; the server stays up for the others
+                logging.exception("request %r failed", request.get("cmd"))
+                reply = {"error": f"{type(error).__name__}: {error}"}
+            connection.send(reply)
 
 
 def main():
@@ -94,7 +110,7 @@ def main():
                                         device=args.device, dtype=args.dtype,
                                         attn_implementation=args.attn_implementation,
                                         max_new_tokens=args.max_new_tokens)
-    policy = MemERDeploymentPolicy(predictor, config=config)
+    shared = SerialPredictor(predictor)
     metadata = {"model": predictor.model_path, "processor": str(Path(predictor.processor_path).resolve()),
                 "system_role": args.system_role, "config": dataclasses.asdict(config)}
     authkey = os.environ.get(AUTHKEY_ENV, "memer-high").encode()
@@ -109,9 +125,9 @@ def main():
             except (EOFError, OSError) as error:  # a client gone before the handshake
                 logging.warning("dropped a connection before the handshake: %r", error)
                 continue
-            with connection:
-                logging.info("client %s connected", listener.last_accepted)
-                serve(connection, policy, metadata)
+            logging.info("client %s connected", listener.last_accepted)
+            policy = MemERDeploymentPolicy(shared, config=config)  # this client's own memory
+            threading.Thread(target=serve, args=(connection, policy, metadata), daemon=True).start()
 
 
 if __name__ == "__main__":
