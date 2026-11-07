@@ -322,3 +322,158 @@ def test_observation_leaves_out_a_scene_camera_and_needs_the_three_of_the_robot(
         f"observation.images.{camera}" for camera in ev.CAMERAS)
     with pytest.raises(ValueError, match="lacks"):
         ev.mikasa_observation({**obs, "sensor_data": sensors("fetch_hand", "base_camera")}, "go")
+
+
+# MemoryVLA: training actions are the recorded targets minus the frame's own joints for the arm,
+# head and torso (vla/memoryvla/patches/0001-fetch-datasets.patch, fetch_dataset_transform)
+FETCH_ARM_STATE, FETCH_HEAD_STATE, FETCH_TORSO_STATE = [2, 4, 5, 6, 7, 8, 9], [1, 3], [0]
+
+
+def training_delta(action, state):
+    return np.concatenate([action[:7] - state[FETCH_ARM_STATE], action[7:8], action[8:10] - state[FETCH_HEAD_STATE],
+                           action[10:11] - state[FETCH_TORSO_STATE], action[11:13]])
+
+
+def robot(state):
+    return {"agent": {"qpos": np.concatenate([[9.0, 9.0, 9.0], state]).astype(np.float32)[None]}}
+
+
+def test_memoryvla_targets_undo_the_training_transform():
+    rng = np.random.default_rng(0)
+    state, action = rng.normal(size=12).astype(np.float32), rng.normal(size=13).astype(np.float32)
+    delta = training_delta(action, state)
+    np.testing.assert_allclose(ev.MemoryVLAClient.targets(delta[None], robot(state))[0], action, atol=1e-6)
+
+
+class JointEnv(FakeEnv):
+    """A robot whose first joint state channel (torso, action 10) counts the control steps."""
+
+    def step(self, action):
+        _, reward, terminated, truncated, info = super().step(action)
+        state = np.zeros(12, np.float32)
+        state[0] = len(self.actions)
+        return robot(state), reward, terminated, truncated, info
+
+
+class RelativeClient(FakeClient):
+    targets = staticmethod(ev.MemoryVLAClient.targets)
+
+    @staticmethod
+    def observation(obs, prompt):
+        return {"step": int(obs["agent"]["qpos"][0, 3]), "prompt": prompt}
+
+
+@pytest.mark.parametrize("execution", ["hold", "midpoint"])
+def test_relative_chunks_are_made_absolute_from_the_joints_of_each_frame(execution):
+    deltas = np.zeros((4, 13), np.float32)
+    deltas[:, 10] = 0.5  # torso: half a unit above wherever it is
+    env, client = JointEnv(), RelativeClient(deltas)
+    out = ev.run_episode(env, robot(np.zeros(12, np.float32)), client, "go", max_steps=8, horizon=4,
+                         execution=execution)
+    assert out["simulator_steps"] == 8 and client.queries == [0]
+    # each 10 Hz target starts from the joints measured after the previous pair: 0, 2, 4, 6
+    assert [float(a[10]) for a in env.actions] == [0.5, 0.5, 2.5, 2.5, 4.5, 4.5, 6.5, 6.5]
+
+
+def test_memoryvla_client_resets_with_the_task_statistics_and_sends_the_frame_index():
+    calls = []
+
+    def call(command, **payload):
+        calls.append((command, payload))
+        return {"ok": True} if command == "reset" else {"actions": np.zeros((16, 13)).tolist(), "memory": 1}
+
+    client = object.__new__(ev.MemoryVLAClient)
+    client.call = call
+    with pytest.raises(ValueError):
+        client.reset("session")
+    client.reset("session", task="veggie")
+    client.ingest(observation())
+    assert client.infer(observation()).shape == (16, 13)
+    for _ in range(16):
+        client.ingest(observation())
+    client.infer(observation())
+    assert calls[0] == ("reset", {"instruction": "put the cup back", "unnorm_key": "fetch_veggie"})
+    assert [payload["frame"] for command, payload in calls if command == "step"] == [0, 16]
+    assert client.extra() == {"memory_entries": 1}
+
+
+def load_memoryvla_server():
+    import sys
+
+    spec = importlib.util.spec_from_file_location("memoryvla_serve", REPO / "vla/memoryvla/serve.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # its dataclass resolves its annotations through the module
+    spec.loader.exec_module(module)
+    return module
+
+
+class FakeVLA:
+    """predict_action's memory handling (vla/memory_vla.py): reset on the first frame, stamp, append."""
+
+    def __init__(self):
+        self.cog_mem_bank, self.per_mem_bank = SimpleNamespace(bank={}), SimpleNamespace(bank={})
+        self.cur_timestep, self.norm_stats, self.seen = 0, {"fetch_veggie": {}, "fetch_samedrawer": {}}, []
+
+    def predict_action(self, *, image, image_wrist, image_wrist_2, instruction, unnorm_key, episode_first_frame,
+                       **kwargs):
+        if episode_first_frame == "True":
+            self.cog_mem_bank.bank, self.per_mem_bank.bank, self.cur_timestep = {}, {}, 0
+        assert image.size == image_wrist.size == image_wrist_2.size == (224, 224)
+        self.seen.append((instruction, [t for t, _ in self.cog_mem_bank.bank.get(0, [])], self.cur_timestep))
+        for bank in (self.cog_mem_bank.bank, self.per_mem_bank.bank):
+            bank.setdefault(0, []).append((self.cur_timestep, instruction))
+        self.cur_timestep += 1
+        return np.full((16, 13), len(self.seen), np.float32), None
+
+
+def memoryvla_frame():
+    return ev.encode_frame({"observation.images.left_base_camera_link": np.zeros((256, 256, 3), np.uint8),
+                            "observation.images.right_base_camera_link": np.zeros((256, 256, 3), np.uint8),
+                            "observation.images.fetch_hand": np.zeros((128, 128, 3), np.uint8)})
+
+
+@pytest.mark.parametrize("timestep", ["call", "frame"])
+def test_memoryvla_server_keeps_every_session_its_own_memory(timestep):
+    server = load_memoryvla_server()
+    vla = FakeVLA()
+    model = server.SessionModel(vla, timestep=timestep)
+    a, b = server.Session(), server.Session()
+    frame = server.decode_frame(memoryvla_frame())
+    model.reset(a, "a", "fetch_veggie")
+    model.reset(b, "b", "fetch_samedrawer")
+    with pytest.raises(KeyError):
+        model.reset(server.Session(), "c", "fetch_unknown")
+    with pytest.raises(ValueError):
+        model.step(server.Session(instruction="d", unnorm_key="fetch_veggie"), 16, frame)  # not at frame 0
+    model.step(a, 0, frame)
+    model.step(b, 0, frame)
+    model.step(a, 16, frame)
+    reply = model.step(a, 32, frame)
+    model.step(b, 16, frame)
+    later = 16 if timestep == "frame" else 1
+    assert vla.seen == [("a", [], 0), ("b", [], 0), ("a", [0], later), ("a", [0, later], 2 * later),
+                        ("b", [0], later)]
+    assert reply["calls"] == 3 and reply["memory"] == 3 and len(reply["actions"]) == 16
+    assert vla.cog_mem_bank.bank == {}  # nothing of a session stays in the model between steps
+
+
+def test_memoryvla_server_replies_errors_and_serves_until_the_client_hangs_up():
+    import threading
+    from multiprocessing import Pipe
+
+    server = load_memoryvla_server()
+    model = server.SessionModel(FakeVLA())
+    near, far = Pipe()
+    thread = threading.Thread(target=server.serve, args=(far, model, {"step": 100000}), daemon=True)
+    thread.start()
+    near.send({"cmd": "metadata"})
+    assert near.recv() == {"step": 100000}
+    near.send({"cmd": "step", "frame": 0, "images": memoryvla_frame()})
+    assert "step before reset" in near.recv()["error"]
+    near.send({"cmd": "reset", "instruction": "go", "unnorm_key": "fetch_veggie"})
+    assert near.recv() == {"ok": True}
+    near.send({"cmd": "step", "frame": 0, "images": memoryvla_frame()})
+    assert near.recv()["calls"] == 1
+    near.close()
+    thread.join(2)
+    assert not thread.is_alive()

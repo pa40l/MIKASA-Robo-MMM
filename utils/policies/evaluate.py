@@ -32,6 +32,10 @@ Backends:
             (examples/robomme/eval.py) does
   robomme   RoboMME's pi0.5 memory variants (memory reset and history ingestion on the server)
   hamlet    HAMLET (GR00T), native memory stride 16
+  memoryvla MemoryVLA (vla/memoryvla/serve.py at --port): one query per executed chunk, the
+            episode memory on the server; its chunk is in the training action space (arm, head
+            and torso as deltas from each frame's own joints), so every executed 10 Hz target is
+            made absolute from the joints measured just before it (MemoryVLAClient.targets)
   recorded  the dataset's first --episodes on their own seeds with their own actions, played to
             the end and judged at the last frame (checks the envs, the seeds and the execution)
 """
@@ -56,6 +60,10 @@ ACTION_REPEAT = 2
 GRIPPER = 7  # utils/collection/contract.py ACTION_NAMES
 EXECUTIONS = ("midpoint", "hold")
 HIGH_AUTHKEY_ENV = "MEMER_HIGH_AUTHKEY"  # vla/memer/serve_high.py reads the same variable
+MEMORYVLA_AUTHKEY_ENV = "MEMORYVLA_AUTHKEY"  # vla/memoryvla/serve.py reads the same variable
+# MemoryVLA's action channel -> the 12D state channel it is a delta from (the arm 0-6, head 8-9 and
+# torso 10; vla/memoryvla/patches/0001-fetch-datasets.patch, fetch_dataset_transform)
+DELTA_FROM_STATE = {0: 2, 1: 4, 2: 5, 3: 6, 4: 7, 5: 8, 6: 9, 8: 1, 9: 3, 10: 0}
 REPO = Path(__file__).resolve().parents[2]
 
 
@@ -198,7 +206,7 @@ class RoboMMEClient:
         self.client = WebsocketClientPolicy(host=host, port=port)
         self.frames = 0
 
-    def reset(self, session):
+    def reset(self, session, task=None):
         # Upstream openpi-client.reset() is a no-op: use the fork's wire command.
         reply = self.client.infer({"reset": True})
         if reply.get("reset_finished") is not True:
@@ -228,7 +236,7 @@ class HamletClient:
         self.client.socket.setsockopt(zmq.SNDTIMEO, 180000)
         self.client.socket.setsockopt(zmq.LINGER, 0)
 
-    def reset(self, session):
+    def reset(self, session, task=None):
         # Memory is keyed by session; reset_memory on the first actual query.
         reply = self.client.reset(options={"session_id": session})
         if not reply.get("memory_reset") or reply.get("remaining_sessions") != 0:
@@ -292,7 +300,7 @@ class MemerClient:
             raise RuntimeError(f"MemER high level: {reply['error']}")
         return reply
 
-    def reset(self, session):
+    def reset(self, session, task=None):
         self.session, self.instruction, self.subtask = session, None, None
         self.pending, self.frames, self.trace = [], 0, []
         self.high_calls = self.parse_failures = self.instruction_prompts = 0
@@ -326,6 +334,66 @@ class MemerClient:
                 "instruction_prompts": self.instruction_prompts, "memory_frames": self.memory}
 
 
+def joint_state(obs):
+    """The 12D state of the datasets (utils/collection/client.py policy_observation): qpos[3:]."""
+    qpos = obs["agent"]["qpos"]
+    if hasattr(qpos, "detach"):
+        qpos = qpos.detach().cpu().numpy()
+    qpos = np.asarray(qpos, dtype=np.float32)
+    if qpos.shape != (1, 15) or not np.isfinite(qpos).all():
+        raise ValueError(f"expected finite qpos (1, 15), got {qpos.shape}")
+    return qpos[0, 3:]
+
+
+class MemoryVLAClient:
+    """MemoryVLA (vla/memoryvla/serve.py): the model sees the frame of each query and keeps its
+    episode memory on the server; the chunk is made absolute frame by frame (targets)."""
+
+    observation = staticmethod(mikasa_observation)
+
+    def __init__(self, host, port):
+        from multiprocessing.connection import Client
+
+        self.server = Client((host, port), authkey=os.environ.get(MEMORYVLA_AUTHKEY_ENV, "memoryvla").encode())
+        self.metadata = self.call("metadata")
+        self.frames = 0
+
+    def call(self, command, **payload):
+        self.server.send({"cmd": command, **payload})
+        reply = self.server.recv()
+        if "error" in reply:
+            raise RuntimeError(f"MemoryVLA: {reply['error']}")
+        return reply
+
+    def reset(self, session, task=None):
+        if task is None:
+            raise ValueError("MemoryVLA needs the task: it picks the task's dataset statistics")
+        self.unnorm_key, self.instruction, self.frames, self.memory = f"fetch_{task}", None, 0, 0
+
+    def ingest(self, observation):
+        if self.instruction is None:
+            self.instruction = observation["prompt"]
+            self.call("reset", instruction=self.instruction, unnorm_key=self.unnorm_key)
+        self.frames += 1
+
+    def infer(self, observation):
+        reply = self.call("step", frame=self.frames - 1, images=encode_frame(observation))
+        self.memory = reply["memory"]
+        return finite_actions(reply["actions"])
+
+    @staticmethod
+    def targets(actions, obs):
+        """Absolute targets: the measured joints added to the arm, head and torso deltas."""
+        state = joint_state(obs)
+        targets = np.array(actions, dtype=np.float32, copy=True)
+        for action, joint in DELTA_FROM_STATE.items():
+            targets[:, action] += state[joint]
+        return targets
+
+    def extra(self):
+        return {"memory_entries": self.memory}
+
+
 class RecordedClient:
     """A dataset episode's own 10 Hz actions, `horizon` per query, until they run out."""
 
@@ -337,7 +405,7 @@ class RecordedClient:
     def load(self, actions):
         self.actions = finite_actions(actions)
 
-    def reset(self, session):
+    def reset(self, session, task=None):
         self.position, self.frames = 0, 0
 
     def ingest(self, observation):
@@ -394,23 +462,30 @@ def run_episode(env, obs, client, prompt, *, max_steps, horizon, execution, stop
             break
         queries += 1
         last_shape = list(np.shape(actions))
-        for index, control in enumerate(control_steps(actions, horizon, execution)):
-            obs, _, terminated, truncated, info = env.step(control)
-            steps += 1
-            if progress is not None:
-                progress.update(env, info, steps)
-            success = scalar_bool(info["success"])
-            success_once |= success
-            if stop_on_success and success:
-                status = "success"
-            elif stop_on_success and scalar_bool(terminated):
-                status = "fail"
-            elif scalar_bool(truncated) or steps >= max_steps:
-                status = "timeout"
+        actions = finite_actions(actions)
+        for index in range(min(horizon, len(actions))):
+            # this target and the next (a midpoint's other end), absolute from the joints of now
+            targets = actions[index:index + 2]
+            if hasattr(client, "targets"):
+                targets = client.targets(targets, obs)
+            for control in control_steps(targets, 1, execution):
+                obs, _, terminated, truncated, info = env.step(control)
+                steps += 1
+                if progress is not None:
+                    progress.update(env, info, steps)
+                success = scalar_bool(info["success"])
+                success_once |= success
+                if stop_on_success and success:
+                    status = "success"
+                elif stop_on_success and scalar_bool(terminated):
+                    status = "fail"
+                elif scalar_bool(truncated) or steps >= max_steps:
+                    status = "timeout"
+                if status:
+                    break
             if status:
                 break
-            if index % ACTION_REPEAT == ACTION_REPEAT - 1:
-                client.ingest(observe(obs))
+            client.ingest(observe(obs))
     return {"status": status, "success": success if not stop_on_success else success_once,
             "success_once": success_once, "simulator_steps": steps, "queries": queries,
             "last_action_shape": last_shape, "history_observations": client.frames,
@@ -495,6 +570,8 @@ def make_client(args):
         return MemerClient(args.host, args.port, args.high_host, args.high_port)
     if args.backend == "recorded":
         return RecordedClient(args.execution_horizon)
+    if args.backend == "memoryvla":
+        return MemoryVLAClient(args.host, args.port)
     return (RoboMMEClient if args.backend == "robomme" else HamletClient)(args.host, args.port)
 
 
@@ -566,7 +643,7 @@ def evaluate(args):
         start = time.time()
         try:
             obs, _ = env.reset(seed=seed, options=options)
-            client.reset(session)
+            client.reset(session, task=task)
             outcome = run_episode(env, obs, client, source.instruction, max_steps=settings[task]["max_steps"],
                                   horizon=args.execution_horizon, execution=args.execution,
                                   stop_on_success=args.backend != "recorded", video=frames,
@@ -577,7 +654,8 @@ def evaluate(args):
                   **({"episode_index": episode.source_index} if episode is not None else {}),
                   **outcome, "seconds": round(time.time() - start, 1), "real_reset_requested": True,
                   "control_hz": 20, "data_hz": 10, "action_repeat": ACTION_REPEAT,
-                  "history_stride_data_steps": 16 if args.backend == "hamlet" else 1,
+                  "history_stride_data_steps": (args.execution_horizon if args.backend in ("hamlet", "memoryvla")
+                                                else 1),
                   **(client.extra() if hasattr(client, "extra") else {})}
         if frames is not None:
             video = args.output.with_name(f"{args.output.stem}-videos") / f"{task}-{seed}.mp4"
@@ -590,7 +668,7 @@ def evaluate(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--backend", choices=("memer", "robomme", "hamlet", "recorded"), required=True)
+    parser.add_argument("--backend", choices=("memer", "robomme", "hamlet", "memoryvla", "recorded"), required=True)
     parser.add_argument("--root", required=True, type=Path, help="one dataset folder per task")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--tasks", nargs="+", choices=TASKS, help="default: every task folder under --root")
